@@ -1,0 +1,1 @@
+trade_id,event_type,timestamp,ticker,side,price,shares,dollar_amount,stop_loss,profit_target,reason_entry,reason_exit,pnl_dollars,pnl_pct,account_balance_after
