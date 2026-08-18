@@ -68,14 +68,19 @@ Each day, before anything gets traded:
    expectations → yields → growth weakness) link by link against real
    data, reporting exactly which links held and which broke.
 3. Ranks **sector rotation** (13 sector ETFs vs. SPY, multiple lookbacks).
-4. Runs the **daily scanner** over a 16-ticker watchlist: relative volume,
-   gaps, price/volume acceleration, range breakouts, a volume-normalized
-   accumulation/distribution trend, relative strength vs. SPY.
+4. Runs the **daily scanner** over a ~465-ticker universe (relative
+   volume, gaps, price/volume acceleration, range breakouts, a
+   volume-normalized accumulation/distribution trend, relative strength
+   vs. SPY) — deliberately wide, not just famous mega-caps, since
+   early-footprint/momentum discovery is a primary objective and unusual
+   activity is more informative (and more common) in less-followed
+   names. See B3.5 for how this stays computationally lightweight.
 5. Pulls **SEC EDGAR filings** (8-K, Form 4, S-1/S-3, 13D/13G) as sourced,
-   timestamped, CONFIRMED catalysts, classified by likely impact.
+   timestamped, CONFIRMED catalysts, classified by likely impact — for
+   the shortlist (see B3.5), not the whole universe.
 6. Pulls a **free-tier options snapshot** (volume/OI per contract) —
    explicitly labeled as NOT sweep/whale data, since that requires a paid
-   feed this system doesn't have.
+   feed this system doesn't have — also shortlist-only.
 7. Cross-references the **14-day forward catalyst calendar** against
    today's activity for **pre-catalyst alerts**.
 8. Scores every candidate: **Early-Signal** (are we early or chasing?),
@@ -112,11 +117,12 @@ Each day, before anything gets traded:
 paper_trading/
 ├── papertrader/            # Part A — unchanged except one extraction (check_exits)
 ├── intelligence/
-│   ├── config.py             # candidate universe, macro tickers, sector ETFs, all Phase 1 tunables
+│   ├── config.py             # CORE_UNIVERSE, WIDE_UNIVERSE import, shortlist cap, all Phase 1 tunables
+│   ├── universe.py            # the ~450-ticker small/mid/large-cap + theme-ETF list (see B3.5)
 │   ├── data_providers.py     # SecEdgarProvider, YFinanceOptionsProvider (+ Fake doubles for tests)
 │   ├── macro.py               # regime engine + cross-asset chain checker
 │   ├── sectors.py             # sector rotation / relative strength
-│   ├── scanner.py             # daily scanner metrics (pure functions of bars)
+│   ├── scanner.py             # daily scanner metrics + is_notable/quick_score (shortlisting)
 │   ├── edgar.py                # SEC filing -> classified Catalyst
 │   └── options_lite.py        # free-tier options snapshot + weak whale-flow score
 ├── catalysts/
@@ -137,8 +143,49 @@ paper_trading/
 ├── target_tracker.py          # $130 -> $2,000 math, measured honestly, never gamed
 ├── run_intel.py                # CLI: `daily` -- the primary entrypoint going forward
 ├── run_daily.py                 # CLI: Part A's original init/run/report, still works standalone
-└── tests/                      # 47 offline tests (synthetic data; see note on network access below)
+└── tests/                      # 57 offline tests (synthetic data; see note on network access below)
 ```
+
+## B3.5. Wide universe, kept computationally lightweight
+
+`CANDIDATE_UNIVERSE` (`intelligence/config.py`) = `CORE_UNIVERSE` (the
+original 16 liquid mega-caps) + `WIDE_UNIVERSE` (`intelligence/universe.py`,
+~450 liquid small/mid/large-cap stocks and theme ETFs). Everything in it
+gets scanned every day — but scanning (price/volume math on bars already
+in memory) is cheap; EDGAR filings and options chains are not, at
+hundreds of tickers a day.
+
+So there's a two-stage funnel, every run:
+1. **Scan everything, cheaply.** `YFinanceProvider.prefetch_daily_bars()`
+   batches the ~465-ticker fetch into a handful of `yf.download()` calls
+   (chunked, threaded) instead of one request per ticker, then
+   `scanner.scan_universe()` runs off that in-memory cache.
+2. **Shortlist.** `CORE_UNIVERSE` is always fully enriched. From
+   `WIDE_UNIVERSE`, only tickers the scanner flags `is_notable()`
+   (elevated relative volume, a breakout/breakdown, price acceleration,
+   or a genuine accumulation/distribution trend) get promoted, ranked by
+   `scanner.quick_score()` and capped at `SHORTLIST_MAX_FROM_WIDE` (40).
+3. **Enrich the shortlist only.** SEC EDGAR filings, the options
+   snapshot, and the full early-signal/convergence/opportunity scoring
+   pass all run only on the shortlist (at most 16 + 40 = 56 tickers),
+   not the full ~465. Everything scanned-but-not-shortlisted still gets
+   a one-line entry in the learning database (`rejected_candidates`) so
+   the record stays complete, just without the expensive per-ticker work.
+
+Raise `SHORTLIST_MAX_FROM_WIDE`, or widen `WIDE_UNIVERSE` itself, once
+performance data justifies spending more daily API calls — this was
+explicitly built to expand later, not as a final number.
+
+**Universe curation, honestly:** there is no free, live, market-wide
+screener API (see the honesty matrix above), so `intelligence/universe.py`
+was hand-compiled by Claude from training knowledge of real, currently-
+listed US tickers — not fetched from a live index feed, and not
+fabricated (ticker symbols are static company identity, not "market
+data" in the sense the no-fabrication rule is about). Some entries may
+have since been acquired, delisted, or renamed; that's handled by the
+same per-ticker `DataUnavailableError` path every other data gap uses —
+logged and skipped, not a crash. The list needs periodic manual refresh,
+same as the macro calendar seed.
 
 ## B4. Scoring, in brief
 
@@ -218,7 +265,7 @@ account on the same day.
 ### Testing
 
 ```bash
-python -m pytest tests/ -v    # 47 tests, all offline/synthetic
+python -m pytest tests/ -v    # 57 tests, all offline/synthetic
 ```
 
 ### A note on network access in this sandbox
@@ -248,3 +295,15 @@ for real data and real (paper) trades.
   `tests/test_scanner.py`). Also tightened alert-level assignment so a
   ticker with zero independent evidence categories can never receive any
   alert level, regardless of baseline score components.
+- 2026-08-18 (later same day): widened the scanner universe from 16 to
+  ~465 tickers (small/mid-caps prioritized, per explicit request — early-
+  footprint discovery is a primary objective and shouldn't be limited to
+  famous names) via `intelligence/universe.py`. Added batched bar
+  prefetching (`YFinanceProvider.prefetch_daily_bars`) and a two-stage
+  scan-all/enrich-shortlist funnel (`scanner.is_notable`/`quick_score`,
+  `SHORTLIST_MAX_FROM_WIDE`) so the wide universe stays computationally
+  lightweight -- EDGAR/options calls are capped at the shortlist (≤56
+  tickers/day), not run against all ~465. Found and fixed the same class
+  of bug again in the new `quick_score()` heuristic (ordinary rel_volume
+  ~1.0x was earning nonzero "notable" credit) before it shipped, caught
+  by a dedicated test. 10 new tests (47 -> 57).

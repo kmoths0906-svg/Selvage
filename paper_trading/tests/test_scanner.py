@@ -65,6 +65,41 @@ def test_flat_series_does_not_falsely_flag_accumulation_or_distribution():
     assert result.accum_dist_trend == "FLAT"
 
 
+def test_is_notable_true_for_elevated_volume():
+    df = with_volume_spike(flat_series(35, END), multiple=4.0, days=1)
+    provider = FakeDataProvider({"XYZ": df, "SPY": flat_series(35, END)}, as_of=NOW)
+    result = scanner.scan_ticker(provider, "XYZ", spy_ret_20d=0.0)
+    assert scanner.is_notable(result) is True
+    assert scanner.quick_score(result) > 0
+
+
+def test_is_notable_false_for_flat_ticker():
+    df = flat_series(35, END)
+    provider = FakeDataProvider({"XYZ": df, "SPY": df}, as_of=NOW)
+    result = scanner.scan_ticker(provider, "XYZ", spy_ret_20d=0.0)
+    assert scanner.is_notable(result) is False
+    assert scanner.quick_score(result) == 0.0
+
+
+def test_is_notable_false_and_zero_score_on_scanner_error():
+    df = flat_series(5, END)  # too short -> error
+    provider = FakeDataProvider({"XYZ": df, "SPY": df}, as_of=NOW)
+    result = scanner.scan_ticker(provider, "XYZ", spy_ret_20d=0.0)
+    assert result.error is not None
+    assert scanner.is_notable(result) is False
+    assert scanner.quick_score(result) == 0.0
+
+
+def test_quick_score_ranks_stronger_setup_higher():
+    weak = with_volume_spike(flat_series(35, END), multiple=1.6, days=1)
+    strong_df = with_breakout_high(flat_series(35, END), above_pct=6.0)
+    strong_df = with_volume_spike(strong_df, multiple=5.0, days=1)
+    provider = FakeDataProvider({"WEAK": weak, "STRONG": strong_df, "SPY": flat_series(35, END)}, as_of=NOW)
+    weak_result = scanner.scan_ticker(provider, "WEAK", spy_ret_20d=0.0)
+    strong_result = scanner.scan_ticker(provider, "STRONG", spy_ret_20d=0.0)
+    assert scanner.quick_score(strong_result) > scanner.quick_score(weak_result)
+
+
 def test_insufficient_history_reports_error_not_crash():
     df = flat_series(10, END)
     provider = FakeDataProvider({"XYZ": df, "SPY": df}, as_of=NOW)

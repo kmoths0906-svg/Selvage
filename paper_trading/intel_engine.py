@@ -9,18 +9,27 @@ Order of operations, once per day:
      reused as-is).
   2. Compute macro regime + cross-asset chains.
   3. Rank sector rotation.
-  4. Run the daily scanner over the candidate universe.
-  5. Pull SEC EDGAR catalysts (recent past) + earnings dates + the hand
-     maintained macro seed -> the 14-day forward calendar.
-  6. Pull options snapshots (free-tier, see intelligence/options_lite.py).
-  7. Cross-reference the calendar against today's activity
+  4. Batch-prefetch bars, then run the cheap daily scanner over the FULL
+     candidate universe (CORE_UNIVERSE + WIDE_UNIVERSE, ~450-500 tickers).
+  5. Two-stage funnel: CORE_UNIVERSE always gets the expensive treatment;
+     WIDE_UNIVERSE tickers only get it if the scanner flagged them
+     "notable," capped at SHORTLIST_MAX_FROM_WIDE by scanner.quick_score.
+     Everything else gets a cheap rejection log entry and nothing more --
+     this is what keeps a ~500-ticker universe computationally light.
+  6. For the shortlist only: pull SEC EDGAR catalysts (recent past) +
+     earnings dates + the hand-maintained macro seed -> the 14-day
+     forward calendar.
+  7. For the shortlist only: pull options snapshots (free-tier, see
+     intelligence/options_lite.py).
+  8. Cross-reference the calendar against today's activity
      (pre-positioning).
-  8. Score every candidate: early-signal, convergence, opportunity.
-  9. Record everything to the learning database.
-  10. Execute any 🔴 ACTIONABLE setup that still has room in the
+  9. Score every shortlisted candidate: early-signal, convergence,
+     opportunity.
+  10. Record everything to the learning database.
+  11. Execute any 🔴 ACTIONABLE setup that still has room in the
       portfolio and is long-only (bullish evidence required -- this
       system never shorts).
-  11. Record the day's equity point and persist portfolio state.
+  12. Record the day's equity point and persist portfolio state.
 """
 
 from __future__ import annotations
@@ -80,6 +89,8 @@ class IntelRunResult:
     executed_trade_ids: list[str]
     noise_ignored: list[str]
     portfolio: Portfolio
+    universe_size: int = 0
+    shortlist_size: int = 0
 
 
 def _atr14(bars: pd.DataFrame) -> Optional[float]:
@@ -188,21 +199,54 @@ def run_daily_intelligence(
     sector_ranking = sectors.rank_sectors(provider)
     strengthening = sectors.strengthening_sectors(sector_ranking)
 
-    # 4. Daily scanner.
+    # 4. Batch-prefetch, then run the cheap scanner over the FULL universe.
+    # 40 days covers both the scanner's own lookback needs and the ATR
+    # window _execute_trade uses later for the (at most a couple of)
+    # tickers that actually end up trading.
+    provider.prefetch_daily_bars(intel_config.CANDIDATE_UNIVERSE + [intel_config.BENCHMARK_TICKER], 40)
     scan_results = scanner.scan_universe(provider, intel_config.CANDIDATE_UNIVERSE)
     scan_by_ticker = {s.ticker: s for s in scan_results}
 
-    # 5. Catalysts: EDGAR (recent past, for scoring) + earnings + macro seed (forward calendar).
-    edgar_catalysts = edgar_mod.build_edgar_catalysts(edgar_provider, intel_config.CANDIDATE_UNIVERSE)
-    earnings_catalysts = calendar_mod.build_earnings_catalysts(intel_config.CANDIDATE_UNIVERSE, earnings_lookup)
+    # 5. Two-stage funnel: CORE always enriched; WIDE only if notable,
+    # capped and ranked by scanner.quick_score so a busy day can't blow
+    # the daily EDGAR/options call budget.
+    core_set = set(intel_config.CORE_UNIVERSE)
+    core_scans = [s for s in scan_results if s.ticker in core_set]
+    wide_notable = sorted(
+        (s for s in scan_results if s.ticker not in core_set and scanner.is_notable(s)),
+        key=scanner.quick_score, reverse=True,
+    )[: intel_config.SHORTLIST_MAX_FROM_WIDE]
+
+    shortlist_scans = core_scans + wide_notable
+    shortlist_tickers = [s.ticker for s in shortlist_scans]
+    shortlist_set = set(shortlist_tickers)
+
+    # Everything scanned but not shortlisted gets a cheap, honest log
+    # entry -- no EDGAR/options call, no full scoring pass.
+    for s in scan_results:
+        if s.ticker in shortlist_set:
+            continue
+        if s.error is not None:
+            reason = f"data_unavailable: {s.error}"
+        else:
+            reason = "Scanned, no notable activity (not promoted to the enrichment shortlist)"
+        learning_db.record_rejected_candidate(
+            db_conn, run_date=today, ticker=s.ticker, opportunity_score=0, reason=reason,
+        )
+
+    # 6. Catalysts: EDGAR (recent past, for scoring) + earnings + macro seed (forward calendar) -- shortlist only.
+    edgar_catalysts = edgar_mod.build_edgar_catalysts(edgar_provider, shortlist_tickers)
+    earnings_catalysts = calendar_mod.build_earnings_catalysts(shortlist_tickers, earnings_lookup)
     cal = calendar_mod.build_calendar(edgar_catalysts, earnings_catalysts, today=today)
     today_cats = calendar_mod.today_catalysts(cal, today=today)
 
-    # 6. Options snapshots.
-    options_results = options_lite.scan_universe_options(options_provider, intel_config.CANDIDATE_UNIVERSE)
+    # 7. Options snapshots -- shortlist only.
+    options_results = options_lite.scan_universe_options(options_provider, shortlist_tickers)
     options_by_ticker = {o.ticker: o for o in options_results}
 
-    # 7. Pre-positioning cross-reference.
+    # 8. Pre-positioning cross-reference (scan_results stays the FULL
+    # universe here so a pre-catalyst alert can still fire off pure
+    # price/volume activity on a shortlisted name).
     precatalyst_alerts = pre_positioning.detect_pre_catalyst_activity(cal, scan_results, options_results, today=today)
     for a in precatalyst_alerts:
         learning_db.record_precatalyst_alert(
@@ -210,10 +254,10 @@ def run_daily_intelligence(
             catalyst_date=a.catalyst.date, days_until=a.days_until_catalyst, evidence=a.evidence,
         )
 
-    # 8-9. Score every candidate and record it.
+    # 9-10. Score every shortlisted candidate and record it.
     candidates: list[CandidateResult] = []
     noise_ignored: list[str] = []
-    for ticker in intel_config.CANDIDATE_UNIVERSE:
+    for ticker in shortlist_tickers:
         scan = scan_by_ticker[ticker]
         ticker_edgar = [c for c in edgar_catalysts if ticker in c.tickers]
         opts = options_by_ticker.get(ticker)
@@ -294,4 +338,5 @@ def run_daily_intelligence(
         calendar=cal, today_catalysts=today_cats, precatalyst_alerts=precatalyst_alerts,
         candidates=candidates, convergence_alert_candidates=convergence_alert_candidates,
         executed_trade_ids=executed_trade_ids, noise_ignored=noise_ignored, portfolio=portfolio,
+        universe_size=len(intel_config.CANDIDATE_UNIVERSE), shortlist_size=len(shortlist_tickers),
     )

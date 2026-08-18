@@ -161,6 +161,52 @@ def scan_universe(provider: MarketDataProvider, tickers: list[str]) -> list[Scan
     return [scan_ticker(provider, t, spy_ret_20d) for t in tickers]
 
 
+def is_notable(result: ScanResult) -> bool:
+    """Cheap, scanner-only gate used to decide which wide-universe
+    tickers are worth the expensive per-ticker EDGAR/options fetch and
+    full scoring pass (see intel_engine.py's two-stage funnel). This is
+    NOT the opportunity score -- it's deliberately cruder and cheaper,
+    since it has to run over hundreds of tickers a day."""
+    if result.error is not None:
+        return False
+    return bool(
+        (result.rel_volume is not None and result.rel_volume >= config.REL_VOLUME_ELEVATED)
+        or result.range_breakout
+        or result.range_breakdown
+        or result.price_accelerating
+        or result.accum_dist_trend in ("ACCUMULATION", "DISTRIBUTION")
+    )
+
+
+def quick_score(result: ScanResult) -> float:
+    """Cheap ranking heuristic for capping the shortlist when more
+    tickers are notable than the daily enrichment budget allows. Higher
+    = more worth spending an EDGAR/options call on today. Not a
+    substitute for scoring/opportunity.py's real opportunity score,
+    which only runs on the (much smaller) shortlist this produces."""
+    if result.error is not None:
+        return 0.0
+    score = 0.0
+    # Only credit volume that's actually elevated -- rel_volume sits
+    # around 1.0x on an ordinary day, and that baseline must not itself
+    # earn points (same bug class as the earlier accum/dist false
+    # positive: an "ordinary" reading must score as ordinary, not
+    # slightly-notable).
+    if result.rel_volume is not None and result.rel_volume >= config.REL_VOLUME_ELEVATED:
+        score += min(result.rel_volume / config.REL_VOLUME_HIGH, 2.0) * 30
+    if result.range_breakout:
+        score += 25
+    if result.range_breakdown:
+        score += 10  # still worth logging/investigating even though this system is long-only
+    if result.price_accelerating:
+        score += 20
+    if result.accum_dist_trend == "ACCUMULATION":
+        score += 15
+    elif result.accum_dist_trend == "DISTRIBUTION":
+        score += 5
+    return score
+
+
 @dataclass
 class PrePostVolume:
     ticker: str

@@ -44,6 +44,8 @@ def format_intel_report(result: IntelRunResult) -> str:
     add("=" * 70)
     add(f"DAILY INTELLIGENCE REPORT -- {result.run_date.isoformat()}")
     add("=" * 70)
+    add(f"Scanned {result.universe_size} tickers; {result.shortlist_size} promoted to full "
+        f"EDGAR/options/scoring enrichment.")
 
     add("\nMARKET REGIME")
     add(f"  {result.regime.regime} (confidence: {result.regime.confidence})")

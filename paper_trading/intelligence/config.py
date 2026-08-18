@@ -10,14 +10,36 @@ from __future__ import annotations
 from pathlib import Path
 
 # --- Universe --------------------------------------------------------
-# The original 10 (unchanged) plus 6 more liquid, higher-beta large/mid
-# caps for more "early footprint" surface area, per explicit user choice
-# to keep the watchlist small (~10-20) rather than attempt a market-wide
-# scan yfinance can't do for free.
-CANDIDATE_UNIVERSE = [
+# CORE_UNIVERSE: the original 16 liquid, well-known large-caps. These
+# always get the FULL treatment every day -- EDGAR filings, options
+# snapshot, and full early-signal/convergence/opportunity scoring --
+# regardless of whether the scanner flags anything, since the list is
+# small and cheap.
+CORE_UNIVERSE = [
     "SPY", "QQQ", "AAPL", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "JPM", "V",
     "AMD", "TSLA", "PLTR", "COIN", "SMCI", "AVGO",
 ]
+
+# WIDE_UNIVERSE: ~450 liquid small/mid/large-cap stocks + theme ETFs
+# (intelligence/universe.py), added so early-footprint/momentum discovery
+# isn't limited to famous mega-caps. Every one of these gets scanned
+# cheaply (batched price/volume fetch) every day, but only the ones the
+# scanner flags as NOTABLE get promoted to the expensive EDGAR/options/
+# full-scoring path -- see SHORTLIST_MAX_FROM_WIDE below and
+# intel_engine.py's two-stage funnel. This is what keeps ~450 tickers
+# "computationally lightweight": the expensive per-ticker network calls
+# (EDGAR, options chains) only ever run for a capped shortlist, not the
+# whole universe, every day.
+from .universe import WIDE_UNIVERSE  # noqa: E402
+
+CANDIDATE_UNIVERSE = list(dict.fromkeys(CORE_UNIVERSE + WIDE_UNIVERSE))
+
+# How many WIDE_UNIVERSE tickers (beyond the always-enriched CORE_UNIVERSE)
+# can be promoted to the expensive EDGAR/options/full-scoring path per
+# day, ranked by scanner.quick_score(). Raise this later if the account
+# and results justify more daily API calls; kept modest for now per the
+# "computationally lightweight" requirement.
+SHORTLIST_MAX_FROM_WIDE = 40
 
 # Indices, rates, dollar, commodities, crypto -- observed, never traded.
 MACRO_TICKERS = {

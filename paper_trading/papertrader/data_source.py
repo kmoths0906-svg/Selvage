@@ -51,6 +51,20 @@ class MarketDataProvider(abc.ABC):
     def get_latest_price(self, ticker: str) -> Quote:
         """Return the most recent tradable price available right now."""
 
+    def prefetch_daily_bars(self, tickers: list[str], lookback_days: int) -> None:
+        """
+        Optional performance hook: warm an internal cache for a batch of
+        tickers in as few network round-trips as possible, so scanning a
+        wide universe (hundreds of tickers) doesn't mean hundreds of
+        sequential per-ticker fetches. Default is a no-op -- providers
+        that have nothing to batch (e.g. FakeDataProvider, which already
+        holds everything in memory) simply don't override it.
+        get_completed_daily_bars must still work correctly even if this
+        was never called; it's a speed optimization, not part of the
+        data contract.
+        """
+        return None
+
 
 class YFinanceProvider(MarketDataProvider):
     """Free, no-API-key data source backed by Yahoo Finance via yfinance."""
@@ -59,28 +73,20 @@ class YFinanceProvider(MarketDataProvider):
         import yfinance as yf  # imported lazily so offline tests don't need it
 
         self._yf = yf
+        self._bar_cache: dict[str, pd.DataFrame] = {}
 
     def _now_eastern(self) -> dt.datetime:
         return dt.datetime.now(tz=config.TIMEZONE)
 
-    def get_completed_daily_bars(self, ticker: str, lookback_days: int) -> pd.DataFrame:
-        period_days = max(lookback_days * 2, lookback_days + 30)  # pad for weekends/holidays
-        df = self._yf.download(
-            ticker,
-            period=f"{period_days}d",
-            interval="1d",
-            progress=False,
-            auto_adjust=False,
-        )
-        if df is None or df.empty:
-            raise DataUnavailableError(f"No daily bars returned for {ticker!r}")
-
+    @staticmethod
+    def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
         df = df.rename(columns=str.title)[["Open", "High", "Low", "Close", "Volume"]]
         df.index = pd.to_datetime(df.index).tz_localize(None)
+        return df.dropna(how="all")
 
+    def _completed_sessions_only(self, df: pd.DataFrame, lookback_days: int) -> pd.DataFrame:
         now = self._now_eastern()
         market_close_today = now.replace(hour=16, minute=0, second=0, microsecond=0)
         today_naive = pd.Timestamp(now.date())
@@ -92,6 +98,63 @@ class YFinanceProvider(MarketDataProvider):
             df = df[df.index <= today_naive]
 
         return df.tail(lookback_days)
+
+    def prefetch_daily_bars(self, tickers: list[str], lookback_days: int, batch_size: int = 100) -> None:
+        """Batch-fetch bars for many tickers in a handful of requests
+        instead of one-per-ticker, so a wide (hundreds-of-tickers)
+        universe stays fast. Best-effort: a failed batch, or a ticker
+        missing from a batch's response (e.g. delisted/renamed), is
+        silently skipped here -- get_completed_daily_bars() falls back to
+        an individual fetch (and ultimately DataUnavailableError) for
+        anything that didn't end up in the cache, exactly as if this had
+        never been called."""
+        period_days = max(lookback_days * 2, lookback_days + 30)
+        unique = list(dict.fromkeys(tickers))
+
+        for i in range(0, len(unique), batch_size):
+            batch = unique[i:i + batch_size]
+            try:
+                raw = self._yf.download(
+                    batch, period=f"{period_days}d", interval="1d", progress=False,
+                    auto_adjust=False, group_by="ticker", threads=True,
+                )
+            except Exception:
+                continue
+            if raw is None or raw.empty:
+                continue
+
+            for ticker in batch:
+                try:
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        if ticker not in raw.columns.get_level_values(0):
+                            continue
+                        sub = raw[ticker].copy()
+                    else:
+                        # A single-ticker batch collapses to a flat frame.
+                        sub = raw.copy()
+                    sub = self._clean_frame(sub)
+                    if not sub.empty:
+                        self._bar_cache[ticker] = sub
+                except Exception:
+                    continue
+
+    def get_completed_daily_bars(self, ticker: str, lookback_days: int) -> pd.DataFrame:
+        if ticker in self._bar_cache:
+            return self._completed_sessions_only(self._bar_cache[ticker], lookback_days)
+
+        period_days = max(lookback_days * 2, lookback_days + 30)  # pad for weekends/holidays
+        df = self._yf.download(
+            ticker,
+            period=f"{period_days}d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
+        if df is None or df.empty:
+            raise DataUnavailableError(f"No daily bars returned for {ticker!r}")
+
+        df = self._clean_frame(df)
+        return self._completed_sessions_only(df, lookback_days)
 
     def get_latest_price(self, ticker: str) -> Quote:
         t = self._yf.Ticker(ticker)
