@@ -121,6 +121,24 @@ CREATE TABLE IF NOT EXISTS ticker_validation (
     notes TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- One row per ticker per run that passed through the shortlist funnel
+-- (intel_engine.py) -- CORE_UNIVERSE tickers (always promoted, not
+-- ranked) and every WIDE_UNIVERSE ticker the scanner flagged notable
+-- (ranked by quick_score, whether or not the cap let it through). This
+-- is what makes the funnel auditable after the fact: without it, the
+-- pre-cap ranking only ever existed in memory during the run and was
+-- lost the moment the process exited.
+CREATE TABLE IF NOT EXISTS shortlist_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    tier TEXT NOT NULL,          -- 'CORE' or 'WIDE'
+    quick_score REAL,             -- NULL for CORE (not ranked by quick_score)
+    rank INTEGER,                 -- rank among WIDE notable tickers, 1 = highest; NULL for CORE
+    promoted INTEGER NOT NULL,    -- 1 if enriched this run, 0 if excluded by the shortlist cap
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -351,3 +369,26 @@ def get_tickers_by_status(conn, status: str) -> list[str]:
 def get_validation_summary(conn) -> dict[str, int]:
     rows = conn.execute("SELECT status, COUNT(*) as n FROM ticker_validation GROUP BY status").fetchall()
     return {r["status"]: r["n"] for r in rows}
+
+
+# --------------------------- Shortlist funnel audit ---------------------------
+
+def record_shortlist_audit(
+    conn, *, run_date: dt.date, ticker: str, tier: str,
+    quick_score: Optional[float], rank: Optional[int], promoted: bool,
+) -> None:
+    conn.execute(
+        "INSERT INTO shortlist_audit (run_date, ticker, tier, quick_score, rank, promoted, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (run_date.isoformat(), ticker, tier, quick_score, rank, int(promoted),
+         dt.datetime.now(tz=dt.timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def get_shortlist_audit(conn, run_date: dt.date) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM shortlist_audit WHERE run_date=? "
+        "ORDER BY tier ASC, promoted DESC, rank ASC",
+        (run_date.isoformat(),),
+    ).fetchall()

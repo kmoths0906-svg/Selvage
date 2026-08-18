@@ -7,6 +7,16 @@ CLI entrypoint for the market-intelligence + paper-trading system.
     python run_intel.py daily --diagnostics    # also print a full pipeline audit
     python run_intel.py revalidate-quarantine  # explicit, low-frequency: recheck quarantined tickers
 
+    # Read-only audit commands -- never mutate account state, journal, or
+    # ticker_validation. Safe to run any number of times; do not count as
+    # "running the sweep." Default to today; pass --date YYYY-MM-DD for a
+    # past run (only works for runs that happened after this tooling was
+    # added -- it reads persisted state, it can't reconstruct history from
+    # before these tables existed).
+    python run_intel.py show-failures [--date YYYY-MM-DD]
+    python run_intel.py show-funnel [--date YYYY-MM-DD]
+    python run_intel.py show-candidate TICKER [TICKER ...] [--date YYYY-MM-DD]
+
 NOTE: this and run_daily.py (the original mechanical-strategy-only
 runner) share the same account state file and the same
 portfolio.last_run_date flag. Run only ONE of them per day -- whichever
@@ -26,14 +36,24 @@ import sys
 import time
 
 import learning_db
+from cli_encoding import ensure_utf8_stdio
 from catalysts import calendar as calendar_mod
 from intel_engine import run_daily_intelligence
-from intel_report import format_diagnostics, format_intel_report
+from intel_report import (
+    format_candidate_detail, format_diagnostics, format_funnel_audit,
+    format_intel_report, format_scan_failures,
+)
 from intelligence import universe_validation
 from intelligence.data_providers import SecEdgarProvider, YFinanceOptionsProvider
 from papertrader import config as pt_config
 from papertrader.data_source import YFinanceProvider
 from papertrader.portfolio import Portfolio
+
+
+def _resolve_date(date_str: str | None) -> dt.date:
+    if date_str is None:
+        return dt.datetime.now(tz=pt_config.TIMEZONE).date()
+    return dt.date.fromisoformat(date_str)
 
 
 def cmd_daily(args: argparse.Namespace) -> None:
@@ -89,7 +109,23 @@ def cmd_revalidate_quarantine(args: argparse.Namespace) -> None:
     print(f"Still QUARANTINED: {still_quarantined or 'none'}")
 
 
+def cmd_show_failures(args: argparse.Namespace) -> None:
+    db_conn = learning_db.get_connection()
+    print(format_scan_failures(db_conn, _resolve_date(args.date)))
+
+
+def cmd_show_funnel(args: argparse.Namespace) -> None:
+    db_conn = learning_db.get_connection()
+    print(format_funnel_audit(db_conn, _resolve_date(args.date)))
+
+
+def cmd_show_candidate(args: argparse.Namespace) -> None:
+    db_conn = learning_db.get_connection()
+    print(format_candidate_detail(db_conn, _resolve_date(args.date), args.tickers))
+
+
 def main() -> None:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Market intelligence + paper trading runner")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -105,6 +141,25 @@ def main() -> None:
         help="Explicit, low-frequency maintenance: recheck currently-quarantined tickers",
     )
     p_revalidate.set_defaults(func=cmd_revalidate_quarantine)
+
+    p_failures = sub.add_parser(
+        "show-failures", help="Read-only: list non-ACTIVE tickers for a date (default today)"
+    )
+    p_failures.add_argument("--date", help="YYYY-MM-DD, defaults to today")
+    p_failures.set_defaults(func=cmd_show_failures)
+
+    p_funnel = sub.add_parser(
+        "show-funnel", help="Read-only: full shortlist funnel audit for a date (default today)"
+    )
+    p_funnel.add_argument("--date", help="YYYY-MM-DD, defaults to today")
+    p_funnel.set_defaults(func=cmd_show_funnel)
+
+    p_candidate = sub.add_parser(
+        "show-candidate", help="Read-only: full evidence detail for one or more tickers on a date"
+    )
+    p_candidate.add_argument("tickers", nargs="+", help="Ticker symbol(s)")
+    p_candidate.add_argument("--date", help="YYYY-MM-DD, defaults to today")
+    p_candidate.set_defaults(func=cmd_show_candidate)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)

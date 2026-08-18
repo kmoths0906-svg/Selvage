@@ -226,3 +226,34 @@ def test_quarantined_ticker_is_excluded_from_the_run(tmp_path, monkeypatch):
     assert result.quarantined_count == 1
     assert quarantined_ticker not in {s.ticker for s in result.all_scan_results}
     assert result.universe_size == len(intel_config.CANDIDATE_UNIVERSE) - 1
+
+
+def test_shortlist_audit_persisted_for_promoted_and_excluded_wide_tickers(tmp_path, monkeypatch):
+    _isolate_state(tmp_path, monkeypatch)
+    histories = {t: flat_series(45, END) for t in _all_needed_tickers()}
+    for t in intel_config.WIDE_UNIVERSE:
+        histories[t] = with_volume_spike(flat_series(45, END), multiple=3.0, days=1)
+
+    provider = FakeDataProvider(histories, as_of=NOW)
+    edgar_provider = FakeEdgarProvider({}, reference_date=NOW.date())
+    options_provider = FakeOptionsProvider({})
+    db_conn = learning_db.get_connection(tmp_path / "learning.db")
+
+    result = intel_engine.run_daily_intelligence(
+        provider, edgar_provider, options_provider,
+        earnings_lookup=lambda t: [], now=NOW, db_conn=db_conn,
+    )
+
+    rows = learning_db.get_shortlist_audit(db_conn, NOW.date())
+    core_rows = [r for r in rows if r["tier"] == "CORE"]
+    wide_rows = [r for r in rows if r["tier"] == "WIDE"]
+    promoted_wide = [r for r in wide_rows if r["promoted"]]
+    excluded_wide = [r for r in wide_rows if not r["promoted"]]
+
+    assert len(core_rows) == len(intel_config.CORE_UNIVERSE)
+    assert all(r["quick_score"] is None for r in core_rows)  # CORE isn't ranked
+    assert len(wide_rows) == len(intel_config.WIDE_UNIVERSE)  # every WIDE ticker was notable
+    assert len(promoted_wide) == intel_config.SHORTLIST_MAX_FROM_WIDE
+    assert len(excluded_wide) == len(intel_config.WIDE_UNIVERSE) - intel_config.SHORTLIST_MAX_FROM_WIDE
+    # Ranking is consistent: every promoted rank is better (lower) than every excluded rank.
+    assert max(r["rank"] for r in promoted_wide) < min(r["rank"] for r in excluded_wide)

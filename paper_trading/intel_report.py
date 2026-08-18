@@ -9,10 +9,20 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import json
 
+import learning_db
 from intel_engine import CandidateResult, IntelRunResult
 from intelligence import config as intel_config
 from papertrader import config as pt_config
+
+# The exact emoji used in the report headers below (\U0001F6A8 CONVERGENCE
+# ALERTS, \U0001F440 PRE-CATALYST ACTIVITY, \U0001F433 WHALE FLOW). None of
+# these encode in cp1252 (Windows' default console code page), which is
+# the root cause of the Windows crash cli_encoding.py fixes. Exported so
+# tests/test_cli_encoding.py stays tied to what's actually in the report
+# rather than a hardcoded string that could silently drift out of sync.
+EMOJI_SAMPLE_FOR_TESTS = "\U0001F6A8\U0001F440\U0001F433"
 
 
 def _thesis(cand: CandidateResult) -> str:
@@ -196,4 +206,121 @@ def format_intel_report(result: IntelRunResult) -> str:
     else:
         add("  Nothing notable rejected today.")
 
+    return "\n".join(L)
+
+
+# ------------------------- Read-only audit reports -------------------------
+# Everything below reads existing state (learning.db) and never mutates
+# account state, journal, or ticker_validation -- safe to run any number
+# of times a day without it counting as "another trading run."
+
+def format_scan_failures(conn, run_date: dt.date) -> str:
+    """Item 2 tooling: every ticker whose status wasn't ACTIVE as of
+    run_date, with its raw last_error. This does NOT classify WHY a
+    ticker failed (delisted/renamed/acquired/temporary) -- that requires
+    external research per ticker, which this tool doesn't attempt."""
+    rows = conn.execute(
+        "SELECT ticker, status, consecutive_failures, last_error, last_checked_date "
+        "FROM ticker_validation WHERE last_checked_date=? AND status != ? ORDER BY ticker",
+        (run_date.isoformat(), learning_db.STATUS_ACTIVE),
+    ).fetchall()
+
+    L = [f"SCAN FAILURES -- {run_date.isoformat()}", "=" * 50]
+    if not rows:
+        L.append(f"No non-ACTIVE tickers recorded for {run_date.isoformat()} "
+                  f"(either everything scanned cleanly, or no run happened this date).")
+        return "\n".join(L)
+
+    L.append(f"{len(rows)} ticker(s):\n")
+    for r in rows:
+        L.append(f"  {r['ticker']:<8} {r['status']:<24} "
+                  f"consecutive_failures={r['consecutive_failures']:<3} last_error={r['last_error']}")
+    L.append("\nThis is the raw signal only. Classifying DELISTED vs. RENAMED/TICKER_CHANGED vs. "
+              "ACQUIRED/TAKEN_PRIVATE vs. TEMPORARY_DATA_FAILURE vs. YFINANCE_ISSUE vs. UNKNOWN "
+              "requires researching each ticker individually -- see universe_validation.record_replacement_ticker() "
+              "for recording any confirmed rename/merger, which is never done automatically.")
+    return "\n".join(L)
+
+
+def format_funnel_audit(conn, run_date: dt.date) -> str:
+    """Item 3 tooling: the full pre-cap WIDE_UNIVERSE ranking (not just
+    the tickers that made the cut), so the shortlist cap's actual bite
+    can be inspected after the fact."""
+    rows = conn.execute(
+        "SELECT ticker, tier, quick_score, rank, promoted FROM shortlist_audit "
+        "WHERE run_date=? ORDER BY tier ASC, rank ASC",
+        (run_date.isoformat(),),
+    ).fetchall()
+
+    L = [f"SHORTLIST FUNNEL AUDIT -- {run_date.isoformat()}", "=" * 50]
+    if not rows:
+        L.append(f"No shortlist_audit rows for {run_date.isoformat()} -- either no run happened "
+                  f"this date, or it ran before shortlist_audit existed (this table was added after "
+                  f"the first real run; it captures every run from here forward, not retroactively).")
+        return "\n".join(L)
+
+    core_rows = [r for r in rows if r["tier"] == "CORE"]
+    wide_rows = [r for r in rows if r["tier"] == "WIDE"]
+    promoted = [r for r in wide_rows if r["promoted"]]
+    excluded = [r for r in wide_rows if not r["promoted"]]
+
+    L.append(f"\nCORE (always enriched, not ranked): {len(core_rows)}")
+    L.append("  " + ", ".join(r["ticker"] for r in core_rows))
+
+    L.append(f"\nWIDE_UNIVERSE notable (ranked by quick_score): {len(wide_rows)} total")
+    L.append(f"Promoted (cap={intel_config.SHORTLIST_MAX_FROM_WIDE}): {len(promoted)}")
+    for r in promoted:
+        L.append(f"  #{r['rank']:<3} {r['ticker']:<8} quick_score={r['quick_score']:.1f}")
+
+    L.append(f"\nExcluded by cap: {len(excluded)}")
+    for r in excluded:
+        L.append(f"  #{r['rank']:<3} {r['ticker']:<8} quick_score={r['quick_score']:.1f}")
+
+    if promoted and excluded:
+        gap = promoted[-1]["quick_score"] - excluded[0]["quick_score"]
+        L.append(f"\nScore gap at the cutoff (#{promoted[-1]['rank']} vs #{excluded[0]['rank']}): "
+                 f"{promoted[-1]['quick_score']:.1f} - {excluded[0]['quick_score']:.1f} = {gap:.1f}")
+    elif not excluded:
+        L.append(f"\nCap not reached -- every notable WIDE_UNIVERSE ticker was promoted, nothing excluded.")
+
+    return "\n".join(L)
+
+
+def format_candidate_detail(conn, run_date: dt.date, tickers: list[str]) -> str:
+    """Item 4 tooling: full evidence for specific ticker(s) from a given
+    day's candidates table -- opportunity/early-signal/convergence
+    scores, categories hit, evidence for/against."""
+    L = [f"CANDIDATE DETAIL -- {run_date.isoformat()}", "=" * 50]
+    for ticker in tickers:
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE run_date=? AND ticker=? ORDER BY id DESC LIMIT 1",
+            (run_date.isoformat(), ticker),
+        ).fetchone()
+        L.append(f"\n{ticker}")
+        if row is None:
+            L.append(f"  No candidate row for {ticker} on {run_date.isoformat()} -- "
+                      f"either it wasn't shortlisted that day, or no run happened this date.")
+            continue
+        L.append(f"  Opportunity {row['opportunity_score']}  Early-Signal {row['early_signal_score']}  "
+                  f"Convergence {row['convergence_score']}  Alert: {row['alert_level']}")
+        L.append(f"  Regime at scoring time: {row['regime']}")
+        L.append(f"  Categories hit: {row['categories_hit'] or '(none)'}")
+        try:
+            evidence_for = json.loads(row["evidence_for"]) if row["evidence_for"] else []
+        except (json.JSONDecodeError, TypeError):
+            evidence_for = []
+        try:
+            evidence_against = json.loads(row["evidence_against"]) if row["evidence_against"] else []
+        except (json.JSONDecodeError, TypeError):
+            evidence_against = []
+        if evidence_for:
+            L.append("  Evidence for:")
+            for e in evidence_for:
+                L.append(f"    - {e}")
+        if evidence_against:
+            L.append("  Evidence against:")
+            for e in evidence_against:
+                L.append(f"    - {e}")
+        if row["trade_id"]:
+            L.append(f"  Executed as trade {row['trade_id']}")
     return "\n".join(L)

@@ -19,6 +19,7 @@ import argparse
 import logging
 import sys
 
+from cli_encoding import ensure_utf8_stdio
 from papertrader import config, engine, journal, report
 from papertrader.data_source import YFinanceProvider
 from papertrader.portfolio import Portfolio
@@ -71,6 +72,7 @@ def cmd_report(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Paper-trading experiment runner")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)

@@ -243,6 +243,22 @@ def run_daily_intelligence(
     shortlist_tickers = [s.ticker for s in shortlist_scans]
     shortlist_set = set(shortlist_tickers)
 
+    # Persist the funnel decision itself -- not just its outcome -- so a
+    # past run's cap behavior (who was promoted, who was excluded, by how
+    # much) can be audited later instead of only existing in that run's
+    # console output.
+    for s in core_scans:
+        learning_db.record_shortlist_audit(
+            db_conn, run_date=today, ticker=s.ticker, tier="CORE",
+            quick_score=None, rank=None, promoted=True,
+        )
+    for idx, s in enumerate(wide_notable_all, start=1):
+        learning_db.record_shortlist_audit(
+            db_conn, run_date=today, ticker=s.ticker, tier="WIDE",
+            quick_score=scanner.quick_score(s), rank=idx,
+            promoted=idx <= intel_config.SHORTLIST_MAX_FROM_WIDE,
+        )
+
     # Everything scanned but not shortlisted gets a cheap, honest log
     # entry -- no EDGAR/options call, no full scoring pass.
     for s in scan_results:
