@@ -41,6 +41,17 @@ CANDIDATE_UNIVERSE = list(dict.fromkeys(CORE_UNIVERSE + WIDE_UNIVERSE))
 # "computationally lightweight" requirement.
 SHORTLIST_MAX_FROM_WIDE = 40
 
+# --- Universe validation (see intelligence/universe_validation.py) -----
+# A ticker is never dropped after one bad day. These are consecutive-
+# failure counts (reset to 0 on any success), so a ticker has to fail
+# this many DAYS IN A ROW before advancing to the next, more serious
+# status: 1 failure -> TEMPORARY_DATA_FAILURE, then at the delisted
+# threshold -> POSSIBLY_DELISTED, then at the quarantine threshold ->
+# QUARANTINED (excluded from future scans until manually revalidated).
+VALIDATION_DELISTED_THRESHOLD = 5        # >= this many consecutive fails: POSSIBLY_DELISTED
+VALIDATION_QUARANTINE_THRESHOLD = 10     # >= this many consecutive fails: QUARANTINED
+VALIDATION_STALE_DAYS = 5                # bars older than this many calendar days vs. today -> STALE
+
 # Indices, rates, dollar, commodities, crypto -- observed, never traded.
 MACRO_TICKERS = {
     "sp500": "SPY",

@@ -192,3 +192,37 @@ def test_core_ticker_always_enriched_even_when_flat(tmp_path, monkeypatch):
     enriched_tickers = {c.ticker for c in result.candidates}
     assert set(intel_config.CORE_UNIVERSE) == enriched_tickers  # nothing from WIDE got promoted
     assert result.shortlist_size == len(intel_config.CORE_UNIVERSE)
+
+
+def test_quarantined_ticker_is_excluded_from_the_run(tmp_path, monkeypatch):
+    _isolate_state(tmp_path, monkeypatch)
+    histories = {t: flat_series(45, END) for t in _all_needed_tickers()}
+    provider = FakeDataProvider(histories, as_of=NOW)
+    edgar_provider = FakeEdgarProvider({}, reference_date=NOW.date())
+    options_provider = FakeOptionsProvider({})
+    db_conn = learning_db.get_connection(tmp_path / "learning.db")
+
+    quarantined_ticker = intel_config.WIDE_UNIVERSE[0]
+    day = NOW.date() - dt.timedelta(days=intel_config.VALIDATION_QUARANTINE_THRESHOLD + 1)
+    from intelligence import universe_validation
+    from intelligence.scanner import ScanResult
+    for i in range(intel_config.VALIDATION_QUARANTINE_THRESHOLD):
+        day += dt.timedelta(days=1)
+        bad_scan = ScanResult(
+            ticker=quarantined_ticker, as_of=day, last_close=float("nan"), rel_volume=None,
+            gap_pct=None, ret_3d_pct=None, ret_prior_3d_pct=None, ret_20d_pct=None,
+            price_accelerating=None, vol_ratio_recent_vs_prior=None, volume_accelerating=None,
+            range_breakout=False, range_breakdown=False, rel_strength_20d_pct=None,
+            accum_dist_trend=None, error="simulated persistent failure",
+        )
+        universe_validation.update_validation_from_scan(db_conn, [bad_scan], today=day)
+    assert learning_db.get_validation_row(db_conn, quarantined_ticker)["status"] == learning_db.STATUS_QUARANTINED
+
+    result = intel_engine.run_daily_intelligence(
+        provider, edgar_provider, options_provider,
+        earnings_lookup=lambda t: [], now=NOW, db_conn=db_conn,
+    )
+
+    assert result.quarantined_count == 1
+    assert quarantined_ticker not in {s.ticker for s in result.all_scan_results}
+    assert result.universe_size == len(intel_config.CANDIDATE_UNIVERSE) - 1

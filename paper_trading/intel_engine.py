@@ -46,7 +46,7 @@ from catalysts import pre_positioning
 from catalysts.models import Catalyst
 from intelligence import config as intel_config
 from intelligence import edgar as edgar_mod
-from intelligence import macro, scanner, sectors
+from intelligence import macro, scanner, sectors, universe_validation
 from intelligence import options_lite
 from intelligence.data_providers import EdgarProvider, OptionsDataProvider
 from intelligence.macro import ChainResult, RegimeResult
@@ -91,6 +91,12 @@ class IntelRunResult:
     portfolio: Portfolio
     universe_size: int = 0
     shortlist_size: int = 0
+    quarantined_count: int = 0
+    validation_status_changes: dict = field(default_factory=dict)
+    failed_count: int = 0
+    wide_notable_count: int = 0  # WIDE_UNIVERSE tickers flagged notable BEFORE the shortlist cap
+    shortlist_cap_reached: bool = False
+    all_scan_results: list[ScanResult] = field(default_factory=list)
 
 
 def _atr14(bars: pd.DataFrame) -> Optional[float]:
@@ -199,23 +205,39 @@ def run_daily_intelligence(
     sector_ranking = sectors.rank_sectors(provider)
     strengthening = sectors.strengthening_sectors(sector_ranking)
 
-    # 4. Batch-prefetch, then run the cheap scanner over the FULL universe.
-    # 40 days covers both the scanner's own lookback needs and the ATR
-    # window _execute_trade uses later for the (at most a couple of)
-    # tickers that actually end up trading.
-    provider.prefetch_daily_bars(intel_config.CANDIDATE_UNIVERSE + [intel_config.BENCHMARK_TICKER], 40)
-    scan_results = scanner.scan_universe(provider, intel_config.CANDIDATE_UNIVERSE)
+    # 4. Filter out quarantined tickers (universe validation -- see
+    # intelligence/universe_validation.py), batch-prefetch, then run the
+    # cheap scanner over the FULL (remaining) universe. 40 days covers
+    # both the scanner's own lookback needs and the ATR window
+    # _execute_trade uses later for the (at most a couple of) tickers
+    # that actually end up trading.
+    active_universe = universe_validation.filter_active_universe(db_conn, intel_config.CANDIDATE_UNIVERSE)
+    quarantined_count = len(intel_config.CANDIDATE_UNIVERSE) - len(active_universe)
+
+    provider.prefetch_daily_bars(active_universe + [intel_config.BENCHMARK_TICKER], 40)
+    scan_results = scanner.scan_universe(provider, active_universe)
     scan_by_ticker = {s.ticker: s for s in scan_results}
+
+    # Update ticker_validation from these SAME scan results -- no extra
+    # fetches. Tickers that just got quarantined are excluded from
+    # enrichment/scoring below (they're already in scan_results for
+    # today, but won't be re-scanned tomorrow).
+    newly_changed_status = universe_validation.update_validation_from_scan(db_conn, scan_results, today)
+
+    failed_count = sum(1 for s in scan_results if s.error is not None)
 
     # 5. Two-stage funnel: CORE always enriched; WIDE only if notable,
     # capped and ranked by scanner.quick_score so a busy day can't blow
     # the daily EDGAR/options call budget.
     core_set = set(intel_config.CORE_UNIVERSE)
     core_scans = [s for s in scan_results if s.ticker in core_set]
-    wide_notable = sorted(
+    wide_notable_all = sorted(
         (s for s in scan_results if s.ticker not in core_set and scanner.is_notable(s)),
         key=scanner.quick_score, reverse=True,
-    )[: intel_config.SHORTLIST_MAX_FROM_WIDE]
+    )
+    wide_notable_count = len(wide_notable_all)
+    shortlist_cap_reached = wide_notable_count > intel_config.SHORTLIST_MAX_FROM_WIDE
+    wide_notable = wide_notable_all[: intel_config.SHORTLIST_MAX_FROM_WIDE]
 
     shortlist_scans = core_scans + wide_notable
     shortlist_tickers = [s.ticker for s in shortlist_scans]
@@ -338,5 +360,8 @@ def run_daily_intelligence(
         calendar=cal, today_catalysts=today_cats, precatalyst_alerts=precatalyst_alerts,
         candidates=candidates, convergence_alert_candidates=convergence_alert_candidates,
         executed_trade_ids=executed_trade_ids, noise_ignored=noise_ignored, portfolio=portfolio,
-        universe_size=len(intel_config.CANDIDATE_UNIVERSE), shortlist_size=len(shortlist_tickers),
+        universe_size=len(active_universe), shortlist_size=len(shortlist_tickers),
+        quarantined_count=quarantined_count, validation_status_changes=newly_changed_status,
+        failed_count=failed_count, wide_notable_count=wide_notable_count,
+        shortlist_cap_reached=shortlist_cap_reached, all_scan_results=scan_results,
     )

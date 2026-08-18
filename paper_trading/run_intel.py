@@ -2,8 +2,10 @@
 """
 CLI entrypoint for the market-intelligence + paper-trading system.
 
-    python run_intel.py daily             # run the full daily intelligence sweep
-    python run_intel.py daily --force      # re-run even if already run today
+    python run_intel.py daily                 # run the full daily intelligence sweep
+    python run_intel.py daily --force          # re-run even if already run today
+    python run_intel.py daily --diagnostics    # also print a full pipeline audit
+    python run_intel.py revalidate-quarantine  # explicit, low-frequency: recheck quarantined tickers
 
 NOTE: this and run_daily.py (the original mechanical-strategy-only
 runner) share the same account state file and the same
@@ -18,12 +20,15 @@ pullback strategy with none of the intelligence layer.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import sys
+import time
 
 import learning_db
 from intel_engine import run_daily_intelligence
-from intel_report import format_intel_report
+from intel_report import format_diagnostics, format_intel_report
+from intelligence import universe_validation
 from intelligence.data_providers import SecEdgarProvider, YFinanceOptionsProvider
 from papertrader import config as pt_config
 from papertrader.data_source import YFinanceProvider
@@ -35,7 +40,6 @@ def cmd_daily(args: argparse.Namespace) -> None:
         print("No account found. Run `python run_daily.py init` first (same account, shared state).")
         sys.exit(1)
 
-    import datetime as dt
     now = dt.datetime.now(tz=pt_config.TIMEZONE)
     today_str = now.date().isoformat()
     portfolio = Portfolio.load()
@@ -48,9 +52,33 @@ def cmd_daily(args: argparse.Namespace) -> None:
     options_provider = YFinanceOptionsProvider()
     db_conn = learning_db.get_connection()
 
+    start = time.perf_counter()
     result = run_daily_intelligence(market_provider, edgar_provider, options_provider,
                                      now=now, db_conn=db_conn)
+    elapsed = time.perf_counter() - start
+
     print(format_intel_report(result))
+    print(f"\nRuntime: {elapsed:.1f}s")
+    if args.diagnostics:
+        print()
+        print(format_diagnostics(result))
+
+
+def cmd_revalidate_quarantine(args: argparse.Namespace) -> None:
+    db_conn = learning_db.get_connection()
+    quarantined = learning_db.get_tickers_by_status(db_conn, learning_db.STATUS_QUARANTINED)
+    if not quarantined:
+        print("No quarantined tickers to revalidate.")
+        return
+
+    print(f"Revalidating {len(quarantined)} quarantined ticker(s): {', '.join(quarantined)}")
+    market_provider = YFinanceProvider()
+    results = universe_validation.revalidate_quarantined(market_provider, db_conn)
+
+    reinstated = [t for t, s in results.items() if s == learning_db.STATUS_ACTIVE]
+    still_quarantined = [t for t, s in results.items() if s == learning_db.STATUS_QUARANTINED]
+    print(f"Reinstated to ACTIVE: {reinstated or 'none'}")
+    print(f"Still QUARANTINED: {still_quarantined or 'none'}")
 
 
 def main() -> None:
@@ -60,7 +88,15 @@ def main() -> None:
 
     p_daily = sub.add_parser("daily", help="Run the full daily intelligence sweep")
     p_daily.add_argument("--force", action="store_true", help="Run even if already run today")
+    p_daily.add_argument("--diagnostics", action="store_true",
+                          help="Also print a full pipeline audit (scan failures, shortlist reasons, cap status)")
     p_daily.set_defaults(func=cmd_daily)
+
+    p_revalidate = sub.add_parser(
+        "revalidate-quarantine",
+        help="Explicit, low-frequency maintenance: recheck currently-quarantined tickers",
+    )
+    p_revalidate.set_defaults(func=cmd_revalidate_quarantine)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)

@@ -124,7 +124,8 @@ paper_trading/
 │   ├── sectors.py             # sector rotation / relative strength
 │   ├── scanner.py             # daily scanner metrics + is_notable/quick_score (shortlisting)
 │   ├── edgar.py                # SEC filing -> classified Catalyst
-│   └── options_lite.py        # free-tier options snapshot + weak whale-flow score
+│   ├── options_lite.py        # free-tier options snapshot + weak whale-flow score
+│   └── universe_validation.py # ticker health state machine (see B3.6) -- zero extra requests
 ├── catalysts/
 │   ├── models.py               # shared Catalyst dataclass
 │   ├── macro_calendar_seed.py  # hand-researched FOMC/CPI/PPI/jobs dates (see B2)
@@ -135,15 +136,15 @@ paper_trading/
 │   ├── convergence.py            # 0-100: independent-category agreement (never double-counted)
 │   └── opportunity.py            # 0-100 overall + alert-level assignment
 ├── learning_db.py            # SQLite: candidates, alerts, convergence alerts, pre-catalyst alerts,
-│                              #   rejections, social verifications, retrospective tests
+│                              #   rejections, social verifications, retrospective tests, ticker validation
 ├── intel_engine.py            # daily orchestrator -- the ONLY place a candidate becomes a trade
 ├── intel_report.py            # the short (max-5-opportunity) daily report
 ├── retrospective.py           # anti-hindsight historical testing harness
 ├── social_verifier.py         # data model + checklist for verifying social-media claims
 ├── target_tracker.py          # $130 -> $2,000 math, measured honestly, never gamed
-├── run_intel.py                # CLI: `daily` -- the primary entrypoint going forward
+├── run_intel.py                # CLI: `daily` (+ --diagnostics) and `revalidate-quarantine`
 ├── run_daily.py                 # CLI: Part A's original init/run/report, still works standalone
-└── tests/                      # 57 offline tests (synthetic data; see note on network access below)
+└── tests/                      # 68 offline tests (synthetic data; see note on network access below)
 ```
 
 ## B3.5. Wide universe, kept computationally lightweight
@@ -186,6 +187,42 @@ have since been acquired, delisted, or renamed; that's handled by the
 same per-ticker `DataUnavailableError` path every other data gap uses —
 logged and skipped, not a crash. The list needs periodic manual refresh,
 same as the macro calendar seed.
+
+## B3.6. Universe validation
+
+Since `intelligence/universe.py` was hand-compiled rather than pulled
+from a live index feed, some tickers on it may already be wrong (acquired,
+delisted, renamed). `intelligence/universe_validation.py` tracks each
+ticker's health in a `ticker_validation` SQLite table with one of:
+
+- `ACTIVE` — fetched cleanly, fresh, has volume.
+- `TEMPORARY_DATA_FAILURE` — failed today; may just be a blip.
+- `STALE` — data fetched, but the bars are old (>5 calendar days) or
+  show no measurable 20-day average volume.
+- `POSSIBLY_DELISTED` — failed 5+ consecutive days.
+- `QUARANTINED` — failed (or stayed stale) 10+ consecutive days.
+  Excluded from every future scan until manually revalidated.
+- `RENAMED_MERGED` — only ever set explicitly (see below), never inferred.
+
+**A ticker is never dropped after one bad day** — every escalation
+requires that many *consecutive* failures, reset to zero by any success.
+
+**Zero extra network requests.** This does not run as a separate
+validation sweep. It updates from the exact `ScanResult`s the daily
+scan already produces — the "small local validation cache" the point of
+which is to *avoid* re-checking tickers, not to add a new check. The
+only thing this costs a request for is `revalidate-quarantine`
+(`python run_intel.py revalidate-quarantine`), a separate, explicitly-
+invoked, low-frequency maintenance command that does one real fetch per
+currently-quarantined ticker to see if any recovered — never run
+automatically.
+
+**Replacement tickers are never guessed.** There's no free API that
+reliably maps an old ticker to what it became after a rename or merger.
+`universe_validation.record_replacement_ticker(conn, old, new, note)` is
+the only way `RENAMED_MERGED` or a `replacement_ticker` value ever gets
+set — a deliberate call with a real, cited reason, made by a human or by
+Claude after doing actual research, never inferred from failure patterns.
 
 ## B4. Scoring, in brief
 
@@ -265,7 +302,7 @@ account on the same day.
 ### Testing
 
 ```bash
-python -m pytest tests/ -v    # 57 tests, all offline/synthetic
+python -m pytest tests/ -v    # 68 tests, all offline/synthetic
 ```
 
 ### A note on network access in this sandbox
@@ -307,3 +344,15 @@ for real data and real (paper) trades.
   of bug again in the new `quick_score()` heuristic (ordinary rel_volume
   ~1.0x was earning nonzero "notable" credit) before it shipped, caught
   by a dedicated test. 10 new tests (47 -> 57).
+- 2026-08-18 (still later): added universe validation
+  (`intelligence/universe_validation.py`) so the hand-compiled ticker
+  list can be trusted over time -- ACTIVE/TEMPORARY_DATA_FAILURE/STALE/
+  POSSIBLY_DELISTED/QUARANTINED/RENAMED_MERGED, escalating only after
+  consecutive (never single-day) failures, zero extra network requests
+  (piggybacks on the daily scan already happening), with quarantine
+  reason+date logged and a separate opt-in `revalidate-quarantine`
+  command for the small quarantined list. Also added `--diagnostics`
+  reporting (scan failure count, pre-cap notable count, whether the
+  shortlist cap bound, per-ticker promotion reasons) and runtime timing
+  to `run_intel.py daily`, in preparation for the first real-data trial.
+  11 new tests (57 -> 68).

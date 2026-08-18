@@ -37,6 +37,43 @@ def _todays_new_and_closed_trades(trade_ids_today: list[str], journal_path) -> t
     return new_rows, closed_rows
 
 
+def format_diagnostics(result: IntelRunResult) -> str:
+    """Full pipeline audit -- NOT part of the terse daily report (§20
+    wants that short). Use `python run_intel.py daily --diagnostics` for
+    this: every scanned ticker's outcome, exactly which WIDE_UNIVERSE
+    tickers were promoted and why, and whether the shortlist cap bound."""
+    L: list[str] = []
+    add = L.append
+
+    add("=" * 70)
+    add("PIPELINE DIAGNOSTICS")
+    add("=" * 70)
+    add(f"Universe scanned: {result.universe_size} (quarantined excluded: {result.quarantined_count})")
+    add(f"Scan failures: {result.failed_count}")
+    add(f"WIDE_UNIVERSE tickers flagged notable (pre-cap): {result.wide_notable_count}")
+    add(f"Shortlist cap (40) reached: {result.shortlist_cap_reached}")
+    add(f"Promoted to enrichment: {result.shortlist_size}")
+    add("")
+
+    add("-- Why each shortlisted ticker was promoted --")
+    for c in result.candidates:
+        basis = ", ".join(c.convergence.categories_hit) if c.convergence.categories_hit else "(no categories -- CORE always enriched)"
+        add(f"  {c.ticker}: {basis}")
+
+    add("")
+    add("-- Scan failures (ticker: error) --")
+    failures = [s for s in result.all_scan_results if s.error is not None]
+    if failures:
+        for s in failures[:50]:
+            add(f"  {s.ticker}: {s.error}")
+        if len(failures) > 50:
+            add(f"  ... and {len(failures) - 50} more")
+    else:
+        add("  None.")
+
+    return "\n".join(L)
+
+
 def format_intel_report(result: IntelRunResult) -> str:
     L: list[str] = []
     add = L.append
@@ -46,6 +83,12 @@ def format_intel_report(result: IntelRunResult) -> str:
     add("=" * 70)
     add(f"Scanned {result.universe_size} tickers; {result.shortlist_size} promoted to full "
         f"EDGAR/options/scoring enrichment.")
+    if result.quarantined_count:
+        add(f"({result.quarantined_count} quarantined ticker(s) excluded from this scan -- "
+            f"run `python run_intel.py revalidate-quarantine` periodically to recheck them.)")
+    if result.validation_status_changes:
+        for ticker, status in result.validation_status_changes.items():
+            add(f"  Validation status change: {ticker} -> {status}")
 
     add("\nMARKET REGIME")
     add(f"  {result.regime.regime} (confidence: {result.regime.confidence})")

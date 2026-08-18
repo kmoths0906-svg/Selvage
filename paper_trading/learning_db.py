@@ -102,7 +102,38 @@ CREATE TABLE IF NOT EXISTS retrospective_tests (
     notes TEXT,
     created_at TEXT NOT NULL
 );
+
+-- See intelligence/universe_validation.py for the state machine this
+-- backs. One row per ticker ever seen in CANDIDATE_UNIVERSE.
+CREATE TABLE IF NOT EXISTS ticker_validation (
+    ticker TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    consecutive_successes INTEGER NOT NULL DEFAULT 0,
+    last_checked_date TEXT,
+    last_success_date TEXT,
+    last_price REAL,
+    last_volume INTEGER,
+    last_error TEXT,
+    quarantined_at TEXT,
+    quarantine_reason TEXT,
+    replacement_ticker TEXT,
+    notes TEXT,
+    updated_at TEXT NOT NULL
+);
 """
+
+
+# ticker_validation.status values. Defined here (the shared data layer,
+# already a dependency of everything) rather than in
+# intelligence/universe_validation.py, so the two modules don't form an
+# import cycle -- universe_validation.py imports these from here.
+STATUS_ACTIVE = "ACTIVE"
+STATUS_TEMPORARY_DATA_FAILURE = "TEMPORARY_DATA_FAILURE"
+STATUS_STALE = "STALE"
+STATUS_POSSIBLY_DELISTED = "POSSIBLY_DELISTED"
+STATUS_RENAMED_MERGED = "RENAMED_MERGED"
+STATUS_QUARANTINED = "QUARANTINED"
 
 
 def get_connection(path: Optional[Path] = None) -> sqlite3.Connection:
@@ -260,3 +291,63 @@ def compute_performance_by_alert_level(conn, journal_csv_path: Path) -> dict[str
             "expectancy": round(sum(pnls) / len(pnls), 2) if pnls else 0.0,
         }
     return result
+
+
+# --------------------------- Ticker validation ---------------------------
+# Raw accessors only -- the state-machine logic (when a status changes,
+# what counts as a failure, quarantine thresholds) lives in
+# intelligence/universe_validation.py, which calls these.
+
+def get_validation_row(conn, ticker: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM ticker_validation WHERE ticker=?", (ticker,)).fetchone()
+
+
+def upsert_validation(
+    conn, *, ticker: str, status: str, consecutive_failures: int, consecutive_successes: int,
+    last_checked_date: dt.date, last_success_date: Optional[dt.date] = None,
+    last_price: Optional[float] = None, last_volume: Optional[int] = None,
+    last_error: Optional[str] = None, quarantined_at: Optional[dt.date] = None,
+    quarantine_reason: Optional[str] = None, replacement_ticker: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    now = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO ticker_validation
+            (ticker, status, consecutive_failures, consecutive_successes, last_checked_date,
+             last_success_date, last_price, last_volume, last_error, quarantined_at,
+             quarantine_reason, replacement_ticker, notes, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            status=excluded.status,
+            consecutive_failures=excluded.consecutive_failures,
+            consecutive_successes=excluded.consecutive_successes,
+            last_checked_date=excluded.last_checked_date,
+            last_success_date=COALESCE(excluded.last_success_date, ticker_validation.last_success_date),
+            last_price=COALESCE(excluded.last_price, ticker_validation.last_price),
+            last_volume=COALESCE(excluded.last_volume, ticker_validation.last_volume),
+            last_error=excluded.last_error,
+            quarantined_at=COALESCE(excluded.quarantined_at, ticker_validation.quarantined_at),
+            quarantine_reason=COALESCE(excluded.quarantine_reason, ticker_validation.quarantine_reason),
+            replacement_ticker=COALESCE(excluded.replacement_ticker, ticker_validation.replacement_ticker),
+            notes=COALESCE(excluded.notes, ticker_validation.notes),
+            updated_at=excluded.updated_at
+        """,
+        (
+            ticker, status, consecutive_failures, consecutive_successes, last_checked_date.isoformat(),
+            last_success_date.isoformat() if last_success_date else None, last_price, last_volume,
+            last_error, quarantined_at.isoformat() if quarantined_at else None, quarantine_reason,
+            replacement_ticker, notes, now,
+        ),
+    )
+    conn.commit()
+
+
+def get_tickers_by_status(conn, status: str) -> list[str]:
+    rows = conn.execute("SELECT ticker FROM ticker_validation WHERE status=?", (status,)).fetchall()
+    return [r["ticker"] for r in rows]
+
+
+def get_validation_summary(conn) -> dict[str, int]:
+    rows = conn.execute("SELECT status, COUNT(*) as n FROM ticker_validation GROUP BY status").fetchall()
+    return {r["status"]: r["n"] for r in rows}
