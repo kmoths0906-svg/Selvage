@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+data/learning.db
+data/edgar_ticker_cik_cache.json

@@ -37,16 +37,13 @@ def _days_held(provider: MarketDataProvider, ticker: str, entry_bar_date: str) -
     return int((bars.index > entry_ts).sum())
 
 
-def run(provider: MarketDataProvider, *, force: bool = False, now: dt.datetime | None = None) -> Portfolio:
-    now = now or dt.datetime.now(tz=config.TIMEZONE)
-    today_str = now.date().isoformat()
-
-    portfolio = Portfolio.load()
-
-    if portfolio.last_run_date == today_str and not force:
-        log.info("Already ran today (%s); skipping. Pass force=True to override.", today_str)
-        return portfolio
-
+def check_exits(provider: MarketDataProvider, portfolio: Portfolio, now: dt.datetime) -> dict[str, float]:
+    """Mark open positions to the current live price and close any that
+    hit their stop, target, or max-hold period. Mutates `portfolio` and
+    the trade journal in place; returns the mark_prices dict built along
+    the way so callers don't have to re-fetch quotes they already paid
+    for. Split out of run() so other callers (e.g. the intelligence
+    engine) can check exits without duplicating this logic."""
     mark_prices: dict[str, float] = {}
     for ticker in list(portfolio.positions.keys()):
         try:
@@ -55,7 +52,6 @@ def run(provider: MarketDataProvider, *, force: bool = False, now: dt.datetime |
         except DataUnavailableError as e:
             log.warning("No live quote for held position %s: %s", ticker, e)
 
-    # --- 1. Check exits on existing positions ---------------------------
     for ticker, pos in list(portfolio.positions.items()):
         price = mark_prices.get(ticker)
         if price is None:
@@ -101,6 +97,22 @@ def run(provider: MarketDataProvider, *, force: bool = False, now: dt.datetime |
             account_balance_after=round(portfolio.equity(mark_prices), 2),
         )
         log.info("EXIT %s: %s | pnl=$%.2f (%.2f%%)", ticker, exit_reason, pnl_dollars, pnl_pct)
+
+    return mark_prices
+
+
+def run(provider: MarketDataProvider, *, force: bool = False, now: dt.datetime | None = None) -> Portfolio:
+    now = now or dt.datetime.now(tz=config.TIMEZONE)
+    today_str = now.date().isoformat()
+
+    portfolio = Portfolio.load()
+
+    if portfolio.last_run_date == today_str and not force:
+        log.info("Already ran today (%s); skipping. Pass force=True to override.", today_str)
+        return portfolio
+
+    # --- 1. Check exits on existing positions ---------------------------
+    mark_prices = check_exits(provider, portfolio, now)
 
     # --- 2. Look for a new entry if we have room -------------------------
     open_slots = config.MAX_OPEN_POSITIONS - len(portfolio.positions)
