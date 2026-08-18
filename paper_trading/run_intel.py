@@ -26,6 +26,7 @@ import sys
 import time
 
 import learning_db
+from catalysts import calendar as calendar_mod
 from intel_engine import run_daily_intelligence
 from intel_report import format_diagnostics, format_intel_report
 from intelligence import universe_validation
@@ -59,6 +60,13 @@ def cmd_daily(args: argparse.Namespace) -> None:
 
     print(format_intel_report(result))
     print(f"\nRuntime: {elapsed:.1f}s")
+    print(
+        "API requests issued (exact, not estimated): "
+        f"market data (yfinance) {market_provider.request_count}, "
+        f"SEC EDGAR {edgar_provider.request_count}, "
+        f"options (yfinance) {options_provider.request_count}, "
+        f"earnings dates (yfinance) {calendar_mod.get_earnings_request_count()}"
+    )
     if args.diagnostics:
         print()
         print(format_diagnostics(result))

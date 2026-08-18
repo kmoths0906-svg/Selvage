@@ -74,6 +74,10 @@ class YFinanceProvider(MarketDataProvider):
 
         self._yf = yf
         self._bar_cache: dict[str, pd.DataFrame] = {}
+        # Exact count of outbound network calls issued through this
+        # provider instance (one per yf.download/Ticker.history call),
+        # for auditing request load -- not an estimate.
+        self.request_count = 0
 
     def _now_eastern(self) -> dt.datetime:
         return dt.datetime.now(tz=config.TIMEZONE)
@@ -114,6 +118,7 @@ class YFinanceProvider(MarketDataProvider):
         for i in range(0, len(unique), batch_size):
             batch = unique[i:i + batch_size]
             try:
+                self.request_count += 1
                 raw = self._yf.download(
                     batch, period=f"{period_days}d", interval="1d", progress=False,
                     auto_adjust=False, group_by="ticker", threads=True,
@@ -143,6 +148,7 @@ class YFinanceProvider(MarketDataProvider):
             return self._completed_sessions_only(self._bar_cache[ticker], lookback_days)
 
         period_days = max(lookback_days * 2, lookback_days + 30)  # pad for weekends/holidays
+        self.request_count += 1
         df = self._yf.download(
             ticker,
             period=f"{period_days}d",
@@ -160,13 +166,16 @@ class YFinanceProvider(MarketDataProvider):
         t = self._yf.Ticker(ticker)
         price = None
         try:
+            self.request_count += 1
             price = t.fast_info.get("last_price")
         except Exception:
             price = None
 
         if price is None or price != price:  # NaN check
+            self.request_count += 1
             hist = t.history(period="1d", interval="1m")
             if hist is None or hist.empty:
+                self.request_count += 1
                 hist = t.history(period="5d", interval="1d")
             if hist is None or hist.empty:
                 raise DataUnavailableError(f"No live quote available for {ticker!r}")

@@ -22,14 +22,24 @@ from intelligence import config as intel_config
 
 EarningsLookup = Callable[[str], list[dt.date]]
 
+# Free function, not a provider instance, so the request counter lives at
+# module scope -- one process per CLI run, so this starts at 0 naturally.
+_earnings_request_count = 0
+
+
+def get_earnings_request_count() -> int:
+    return _earnings_request_count
+
 
 def yfinance_earnings_lookup(ticker: str) -> list[dt.date]:
     """Real implementation. Best-effort: yfinance's earnings-date data is
     sourced from third parties and can be missing or wrong; failures
     return an empty list rather than raising, since a calendar with a
     gap is far better than a calendar that crashes."""
+    global _earnings_request_count
     try:
         import yfinance as yf
+        _earnings_request_count += 1
         df = yf.Ticker(ticker).get_earnings_dates(limit=8)
         if df is None or df.empty:
             return []

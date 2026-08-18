@@ -86,6 +86,7 @@ class SecEdgarProvider(EdgarProvider):
         self._session.headers.update({"User-Agent": config.SEC_EDGAR_CONTACT})
         self._cache_path = cache_path or (config.INTEL_DIR / "data" / "edgar_ticker_cik_cache.json")
         self._ticker_to_cik: Optional[dict[str, str]] = None
+        self.request_count = 0  # exact count of SEC EDGAR HTTP requests issued
 
     def _load_ticker_map(self) -> dict[str, str]:
         if self._ticker_to_cik is not None:
@@ -99,6 +100,7 @@ class SecEdgarProvider(EdgarProvider):
             except (json.JSONDecodeError, OSError):
                 pass
 
+        self.request_count += 1
         resp = self._session.get(self.TICKER_MAP_URL, timeout=15)
         if resp.status_code != 200:
             raise DataUnavailableError(f"EDGAR ticker map fetch failed: HTTP {resp.status_code}")
@@ -117,6 +119,7 @@ class SecEdgarProvider(EdgarProvider):
             raise DataUnavailableError(f"No CIK found for ticker {ticker!r} in EDGAR ticker map")
 
         url = self.SUBMISSIONS_URL.format(cik10=cik)
+        self.request_count += 1
         resp = self._session.get(url, timeout=15)
         if resp.status_code != 200:
             raise DataUnavailableError(f"EDGAR submissions fetch failed for {ticker}: HTTP {resp.status_code}")
@@ -219,10 +222,12 @@ class YFinanceOptionsProvider(OptionsDataProvider):
     def __init__(self) -> None:
         import yfinance as yf
         self._yf = yf
+        self.request_count = 0  # exact count of yfinance calls issued for options
 
     def get_nearest_expirations(self, ticker: str, count: int) -> list[str]:
         t = self._yf.Ticker(ticker)
         try:
+            self.request_count += 1
             exps = list(t.options)
         except Exception as e:
             raise DataUnavailableError(f"No options expirations for {ticker!r}: {e}")
@@ -233,11 +238,13 @@ class YFinanceOptionsProvider(OptionsDataProvider):
     def get_option_chain(self, ticker: str, expiration: str) -> OptionChain:
         t = self._yf.Ticker(ticker)
         try:
+            self.request_count += 1
             chain = t.option_chain(expiration)
         except Exception as e:
             raise DataUnavailableError(f"Option chain fetch failed for {ticker!r} {expiration}: {e}")
 
         try:
+            self.request_count += 1
             underlying_price = float(t.fast_info.get("last_price"))
         except Exception:
             underlying_price = float("nan")
